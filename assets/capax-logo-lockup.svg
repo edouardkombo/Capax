@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420">
+  <rect width="1200" height="420" fill="#ffffff"/>
+  <circle cx="220" cy="210" r="150" fill="#000000"/>
+  <text x="220" y="260" text-anchor="middle"
+        font-family="Arial, Helvetica, sans-serif" font-size="150" font-weight="800"
+        fill="#ffffff" letter-spacing="-10">cx</text>
+
+  <text x="420" y="255" font-family="Arial, Helvetica, sans-serif"
+        font-size="120" font-weight="800" fill="#000000" letter-spacing="6">CAPAX</text>
+  <text x="424" y="310" font-family="Arial, Helvetica, sans-serif"
+        font-size="24" font-weight="600" fill="#000000" letter-spacing="1">query concurrency gate + conformance QA</text>
+</svg>

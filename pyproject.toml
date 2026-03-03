@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capax"
+version = "0.2.3"
+description = "Spec-to-code query admission control (weighted concurrency) with conformance QA and multi-runtime codegen."
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn>=0.27.0",
+  "PyYAML>=6.0.1",
+  "requests>=2.31.0",
+]
+
+[project.scripts]
+capax = "capax.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["capax*"]
+exclude = ["assets*"]
