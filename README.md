@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/capax-logo.svg" alt="Capax" width="160" />
+  <img src="assets/capax-logo-icon.svg" alt="Capax" width="160" />
 </p>
 
 # Capax
