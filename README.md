@@ -21,12 +21,12 @@ If starting a request would exceed the safe workload budget, Capax rejects it im
 
 ```mermaid
 flowchart LR
-    Client -->|HTTP Request| Capax
-    Capax -->|Admit| API
-    Capax -->|Reject (429)| Client
-    API --> Database
-    API --> ExternalAPIs
-    API --> GPU
+    client[Client] -->|"HTTP Request"| capax[Capax]
+    capax -->|"Admit"| api[API]
+    capax -->|"Reject (429)"| client
+    api --> db[Database]
+    api --> ext[External APIs]
+    api --> gpu[GPU]
 ```
 
 Capax acts as a **cost‑aware gatekeeper** in front of expensive infrastructure.
