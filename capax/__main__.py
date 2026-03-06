@@ -80,9 +80,17 @@ def _load_pack_scenarios(root: Path, pack: str) -> List[Any]:
     return generate_scenarios(policy, sample)
 
 
-def _write_qa_report(root: Path, pack: str, ok: bool, errors: List[Dict[str, Any]], scenarios: List[Any], url: str) -> Path:
+def _write_qa_report(
+    root: Path,
+    pack: str,
+    ok: bool,
+    errors: List[Dict[str, Any]],
+    scenarios: List[Any],
+    url: str,
+    details: Dict[str, Any] | None = None,
+) -> Path:
     report_path = root / ".capax" / "reports" / f"{pack}-qa-report.json"
-    save_report(report_path, ok, errors, scenarios, url)
+    save_report(report_path, ok, errors, scenarios, url, details=details)
     return report_path
 
 
@@ -288,8 +296,14 @@ def cmd_qa(args: argparse.Namespace) -> int:
     policy = _load_pack_policy_for_cli(root, args.pack)
     scenarios = _load_pack_scenarios(root, args.pack)
 
-    ok, errors = run_scenarios(args.url, policy, scenarios, progress=_say)
-    report_path = _write_qa_report(root, args.pack, ok, errors, scenarios, args.url)
+    qa_out = run_scenarios(args.url, policy, scenarios, progress=_say)
+    if isinstance(qa_out, tuple) and len(qa_out) == 3:
+        ok, errors, details = qa_out
+    else:
+        ok, errors = qa_out
+        details = None
+
+    report_path = _write_qa_report(root, args.pack, ok, errors, scenarios, args.url, details=details)
 
     _say("")
     _say(f"QA report saved: {report_path}")
@@ -386,3 +400,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
