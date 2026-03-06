@@ -39,7 +39,7 @@ def build_app(registry_path: Path) -> FastAPI:
                 g = gate_for(pack_name, policy_path)
                 payload = await g.status()
                 return JSONResponse(status_code=200, content=payload)
-            app.add_api_route(path, _status, methods=["GET"])
+            app.add_api_route(path, _status, methods=[method])
             continue
 
         async def _admit(req: Request, pack_name: str = pack, policy_path: Path = policy_yaml, m: str = method, p: str = path):

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "capax"
-version = "0.2.3"
-description = "Spec-to-code query admission control (weighted concurrency) with conformance QA and multi-runtime codegen."
+version = "0.3.0"
+description = "Capax: query cost guardrail for APIs with weighted concurrency, QA scenarios, and multi-runtime code generation."
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.110.0",
@@ -20,4 +20,4 @@ capax = "capax.__main__:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["capax*"]
-exclude = ["assets*"]
+exclude = ["assets*", "packs*", "gen*", "server*", "tests*", "docs*"]

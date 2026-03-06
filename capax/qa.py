@@ -1,218 +1,534 @@
 from __future__ import annotations
 
+import json
+import random
+import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Tuple
 
 import requests
-
-from .config import Policy
-
-
-@dataclass
-class Scenario:
-    name: str
-    steps: List[Dict[str, Any]]
+import yaml
 
 
-def _make_body(sample: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
-    b = dict(sample)
-    b.update(updates)
-    return b
+def save_scenarios(path: Path, scenarios: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(scenarios, sort_keys=False), encoding="utf-8")
 
 
-def _nonce(i: int) -> str:
-    return f"qa_{int(time.time()*1000)}_{i}"
+def _case_variants(value: str) -> List[str]:
+    if not isinstance(value, str) or not value:
+        return []
+    out = []
+    candidates = [
+        value.upper(),
+        value.lower(),
+        value.capitalize(),
+        "".join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(value)),
+    ]
+    for c in candidates:
+        if c != value and c not in out:
+            out.append(c)
+    return out
 
 
-def compute_cost_from_policy(policy: Policy, body: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
-    field = policy.cost.field
-    if not field:
-        return 1, None
-    raw = body.get(field)
-    if raw is None:
-        return 1, None
-
-    token_costs = policy.cost.token_costs or {}
-    token_costs_ci = {str(k).casefold(): int(v) for k, v in token_costs.items()}
-    unknown = policy.cost.unknown_action
-    unknown_default = policy.cost.unknown_default_cost
-
-    def token_cost(tok: str) -> Tuple[Optional[int], Optional[str]]:
-        if tok in token_costs:
-            return int(token_costs[tok]), None
-        tcf = tok.casefold()
-        if tcf in token_costs_ci:
-            return int(token_costs_ci[tcf]), None
-        if unknown == "reject_400":
-            return None, f"unknown_token:{tok}"
-        return int(unknown_default), None
-
-    if not isinstance(raw, str):
-        return token_cost(str(raw))
-
-    s = raw.strip()
-    if not s:
-        return 1, None
-
-    tokens = [s]
-    for sep in policy.cost.separators:
-        nxt: List[str] = []
-        for t in tokens:
-            if sep in t:
-                nxt.extend([x.strip() for x in t.split(sep) if x.strip()])
+def _policy_get(policy: Any, *paths: str, default: Any = None) -> Any:
+    """
+    Try multiple dotted paths and return the first match.
+    Supports both dict-shaped compiled policies and Policy/dataclass objects used in the wizard.
+    """
+    for path in paths:
+        cur: Any = policy
+        ok = True
+        for part in path.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            elif hasattr(cur, part):
+                cur = getattr(cur, part)
             else:
-                nxt.append(t.strip())
-        tokens = nxt
-
-    seen = set()
-    uniq: List[str] = []
-    for t in tokens:
-        if t and t not in seen:
-            uniq.append(t)
-            seen.add(t)
-
-    costs: List[int] = []
-    for tok in uniq:
-        c, err = token_cost(tok)
-        if err:
-            return None, err
-        costs.append(int(c))  # type: ignore
-
-    if not costs:
-        return 1, None
-    if len(costs) == 1:
-        return costs[0], None
-
-    if policy.cost.combine_mode == "bundle_sum":
-        return sum(costs), None
-    return max(costs), None
+                ok = False
+                break
+        if ok:
+            return cur
+    return default
 
 
-def generate_scenarios(policy: Policy, sample_body: Dict[str, Any]) -> List[Scenario]:
-    scenarios: List[Scenario] = []
-    token_costs = policy.cost.token_costs or {}
-    if not policy.cost.field or not token_costs:
-        token_costs = {"_default": 1}
+def _ensure_policy_dict(policy: Any) -> Any:
+    return policy
 
-    cheapest_tok = min(token_costs.keys(), key=lambda k: token_costs[k])
-    heaviest_tok = max(token_costs.keys(), key=lambda k: token_costs[k])
 
-    cheapest_cost = int(token_costs.get(cheapest_tok, 1))
-    heaviest_cost = int(token_costs.get(heaviest_tok, 1))
-    cap = int(policy.max_allowed_concurrent_capacity)
+def generate_scenarios(policy: Any, sample: Dict[str, Any]) -> List[Dict[str, Any]]:
+    policy = _ensure_policy_dict(policy)
+    scenarios: List[Dict[str, Any]] = []
 
-    def body_for_token(tok: str, i: int) -> Dict[str, Any]:
-        u = {"_qaNonce": _nonce(i)}
-        if policy.cost.field and tok != "_default":
-            u[policy.cost.field] = tok
-        return _make_body(sample_body, u)
+    ladders = _policy_get(
+        policy,
+        "weight_ladder",
+        "cost.token_costs",
+        "cost_expression.token_costs",
+        default={},
+    ) or {}
+    field = _policy_get(policy, "weight_field", "cost.field", "cost_expression.field")
+    max_capacity = int(
+        _policy_get(
+            policy,
+            "max_allowed_concurrent_capacity",
+            "capacity.max",
+            "capacity.max_allowed_concurrent_capacity",
+            default=5,
+        )
+    )
+    bad_request_status = int(
+        _policy_get(
+            policy,
+            "bad_request_status",
+            "http.bad_request",
+            "http.codes.bad_request",
+            default=400,
+        )
+    )
 
-    # Fill with cheapest until full, then one more should be 429.
-    max_cheapest = max(1, cap // max(1, cheapest_cost))
-    steps = []
-    for i in range(max_cheapest):
-        steps.append({"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(cheapest_tok, i), "expect_status": policy.http.accepted})
-    steps.append({"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(cheapest_tok, max_cheapest), "expect_status": policy.http.at_capacity})
-    scenarios.append(Scenario("fill_with_cheapest_then_overflow", steps))
+    cheap_value = None
+    heavy_value = None
+    normal_value = None
 
-    # Mixed boundary: start with heaviest, then fill remainder with cheapest, then overflow.
-    if heaviest_cost <= cap:
-        k = max(0, (cap - heaviest_cost) // max(1, cheapest_cost))
-        steps = [{"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(heaviest_tok, 100), "expect_status": policy.http.accepted}]
-        for j in range(k):
-            steps.append({"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(cheapest_tok, 101 + j), "expect_status": policy.http.accepted})
-        steps.append({"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(cheapest_tok, 200), "expect_status": policy.http.at_capacity})
-        scenarios.append(Scenario("mixed_boundary_then_overflow", steps))
-    else:
-        scenarios.append(Scenario("heaviest_always_rejected", [
-            {"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(heaviest_tok, 300), "expect_status": policy.http.at_capacity}
-        ]))
+    if ladders:
+        sorted_ladder = sorted(ladders.items(), key=lambda x: x[1])
+        cheap_value = sorted_ladder[0][0]
+        heavy_value = sorted_ladder[-1][0]
+        if len(sorted_ladder) >= 3:
+            normal_value = sorted_ladder[1][0]
+        elif len(sorted_ladder) >= 2:
+            normal_value = sorted_ladder[1][0]
+        else:
+            normal_value = cheap_value
 
-    scenarios.append(Scenario("telemetry_reflects_completion", [
-        {"method": policy.endpoint_method, "path": policy.endpoint_path, "body": body_for_token(cheapest_tok, 400), "expect_status": policy.http.accepted},
-        {"method": "GET", "path": policy.status_path, "body": None, "expect_status": 200, "expect_contains": {"servedOrders_len_at_least": 0}},
-        {"wait_s": float(policy.duration_seconds) + 0.25},
-        {"method": "GET", "path": policy.status_path, "body": None, "expect_status": 200, "expect_contains": {"servedOrders_len_at_least": 1}},
-    ]))
+    def make_payload(value: Any = None) -> Dict[str, Any]:
+        p = sample.copy()
+        if field and value is not None:
+            p[field] = value
+        return p
+
+    if field and cheap_value is not None:
+        scenarios.append(
+            {
+                "name": "cheap_request_accepts",
+                "why": "Cheapest known value should be accepted when capacity is available.",
+                "payload": make_payload(cheap_value),
+                "expect": 200,
+            }
+        )
+
+    if field and heavy_value is not None:
+        scenarios.append(
+            {
+                "name": "heavy_request_accepts",
+                "why": "Heavy known value should still be accepted when sent alone if it fits budget.",
+                "payload": make_payload(heavy_value),
+                "expect": 200,
+            }
+        )
+
+    if field and cheap_value is not None:
+        for v in _case_variants(str(cheap_value)):
+            scenarios.append(
+                {
+                    "name": f"case_variant_{v}",
+                    "why": "Known values must match case-insensitively.",
+                    "payload": make_payload(v),
+                    "expect": 200,
+                }
+            )
+
+    if field:
+        unknown_action = _policy_get(
+            policy,
+            "unknown_action",
+            "cost.unknown_action",
+            "cost_expression.unknown.action",
+            default="reject",
+        )
+        scenarios.append(
+            {
+                "name": "unexpected_value_behavior",
+                "why": "Totally unexpected values must follow the configured validation behavior.",
+                "payload": make_payload("totally_unexpected_value"),
+                "expect": bad_request_status if unknown_action in {"reject", "reject_400"} else 200,
+            }
+        )
+
+        missing_payload = sample.copy()
+        if field in missing_payload:
+            del missing_payload[field]
+
+        missing_action = _policy_get(
+            policy,
+            "missing_action",
+            "cost.missing_field_action",
+            "cost_expression.missing_field.action",
+            default="reject",
+        )
+        scenarios.append(
+            {
+                "name": "missing_weight_field_behavior",
+                "why": "Missing weight-driving field must follow the configured validation behavior.",
+                "payload": missing_payload,
+                "expect": bad_request_status if missing_action in {"reject", "reject_400"} else 200,
+            }
+        )
+
+    scenarios.append(
+        {
+            "name": "overflow_capacity",
+            "why": "More than the safe budget must cause overflow rejections.",
+            "payload": make_payload(cheap_value),
+            "expect": 429,
+            "concurrency_test": True,
+        }
+    )
+
+    if field and cheap_value is not None and heavy_value is not None and cheap_value != heavy_value:
+        scenarios.append(
+            {
+                "name": "mixed_workload_capacity",
+                "why": "Mixed cheap and heavy requests must still respect the same hard budget.",
+                "mix_test": True,
+                "mix_values": [cheap_value, heavy_value, normal_value or cheap_value],
+                "expect_any": [200, 429],
+            }
+        )
+
+    scenarios.append(
+        {
+            "name": "randomized_load_simulation",
+            "why": "Random load with mixed known values, case variants, and unexpected values should never break admission rules.",
+            "simulation_test": True,
+            "simulation_rounds": max(12, max_capacity * 4),
+            "expect_any": [200, 429, bad_request_status],
+        }
+    )
 
     return scenarios
 
 
-def _describe_cost(policy: Policy, body: Dict[str, Any]) -> str:
-    cost, err = compute_cost_from_policy(policy, body)
-    field = policy.cost.field
-    if err:
-        return f"computed_cost=ERR({err})"
-    if not field:
-        return f"computed_cost={cost}"
-    return f"{field}={body.get(field)!r} computed_cost={cost}"
+def _normalized_url(base_url: str, path: str) -> str:
+    if not base_url.startswith("http://") and not base_url.startswith("https://"):
+        base_url = "http://" + base_url
+    if not path.startswith("/"):
+        path = "/" + path
+    return base_url.rstrip("/") + path
 
 
-def run_scenarios(base_url: str, policy: Policy, scenarios: List[Scenario], timeout_s: float = 5.0) -> Tuple[bool, List[str]]:
-    errors: List[str] = []
-    base = base_url.rstrip("/")
-    cap = int(policy.max_allowed_concurrent_capacity)
+def _http(method: str, url: str, payload: Dict[str, Any], timeout: float = 5.0) -> requests.Response:
+    return requests.request(method.upper(), url, json=payload, timeout=timeout)
 
-    drain_wait = float(policy.duration_seconds) + 0.75  # more generous barrier
 
-    for sc in scenarios:
-        print(f"Scenario: {sc.name}")
-        for idx, step in enumerate(sc.steps):
-            if "wait_s" in step:
-                w = float(step["wait_s"])
-                print(f"  Step {idx}: WAIT {w:.2f}s")
-                time.sleep(w)
-                continue
+def _scenario_actor(scenario_name: str, suffix: str = "") -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in scenario_name).strip("_") or "scenario"
+    return f"capax_{token}{suffix}"
 
-            method = step["method"].upper()
-            url = f"{base}{step['path']}"
-            body = step.get("body", None)
-            exp = int(step["expect_status"])
 
-            if method == "GET":
-                print(f"  Step {idx}: GET {step['path']} expect={exp}", end="")
-            else:
-                cost_desc = _describe_cost(policy, body)
-                print(f"  Step {idx}: {method} {step['path']} cap={cap} {cost_desc} expect={exp}", end="")
+def _apply_isolation_actor(payload: Dict[str, Any], isolation_field: str | None, actor_value: str | None) -> Dict[str, Any]:
+    if isolation_field and actor_value is not None:
+        payload[isolation_field] = actor_value
+    return payload
 
-            try:
-                if method == "GET":
-                    r = requests.get(url, timeout=timeout_s)
+
+def _sleep_for_release(seconds: float, emit: Callable[[str], None], reason: str) -> None:
+    delay = max(0.0, float(seconds))
+    if delay <= 0:
+        return
+    emit(f"  waiting {delay:.2f}s so previous accepted work releases capacity before {reason}")
+    time.sleep(delay)
+
+
+def run_scenarios(
+    base_url: str,
+    policy: Any,
+    scenarios: List[Dict[str, Any]],
+    progress: Callable[[str], None] | None = None,
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    policy = _ensure_policy_dict(policy)
+    errors: List[Dict[str, Any]] = []
+    ok = True
+
+    method = str(
+        _policy_get(
+            policy,
+            "method",
+            "endpoint_method",
+            "http.protect.method",
+            "protect.endpoint.method",
+            "protect.entry.method",
+            default="POST",
+        )
+    ).upper()
+
+    path = str(
+        _policy_get(
+            policy,
+            "path",
+            "endpoint_path",
+            "http.protect.path",
+            "protect.endpoint.path",
+            "protect.entry.path",
+            default="/",
+        )
+    )
+
+    sample_request = _policy_get(policy, "sample_request", "request_example", "query.example", default={}) or {}
+    field = _policy_get(policy, "weight_field", "cost.field", "cost_expression.field")
+    ladders = _policy_get(
+        policy,
+        "weight_ladder",
+        "cost.token_costs",
+        "cost_expression.token_costs",
+        default={},
+    ) or {}
+    accepted_status = int(
+        _policy_get(
+            policy,
+            "accepted_status",
+            "http.accepted",
+            "http.codes.accepted",
+            default=200,
+        )
+    )
+    bad_request_status = int(
+        _policy_get(
+            policy,
+            "bad_request_status",
+            "http.bad_request",
+            "http.codes.bad_request",
+            default=400,
+        )
+    )
+    max_capacity = int(
+        _policy_get(
+            policy,
+            "max_allowed_concurrent_capacity",
+            "capacity.max",
+            "capacity.max_allowed_concurrent_capacity",
+            default=5,
+        )
+    )
+    hold_seconds = float(
+        _policy_get(
+            policy,
+            "duration_seconds",
+            "capacity.duration_seconds",
+            default=0.0,
+        )
+    )
+    isolation_enabled = bool(
+        _policy_get(
+            policy,
+            "capacity.isolation.enabled",
+            "isolation.enabled",
+            default=False,
+        )
+    )
+    isolation_field = _policy_get(
+        policy,
+        "capacity.isolation.field",
+        "isolation.field",
+        default=None,
+    )
+
+    url = _normalized_url(base_url, path)
+
+    def emit(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    emit(f"Target URL: {url}")
+    emit(f"HTTP method: {method}")
+    emit("")
+
+    known_values = list(ladders.keys())
+    must_drain_between_scenarios = not (isolation_enabled and isolation_field)
+
+    for i, sc in enumerate(scenarios, start=1):
+        emit(f"[{i}/{len(scenarios)}] Running scenario: {sc['name']}")
+        emit(f"Why: {sc.get('why', 'No explanation provided.')}" )
+
+        if i > 1 and must_drain_between_scenarios:
+            _sleep_for_release(hold_seconds + 0.05, emit, sc["name"])
+
+        try:
+            if sc.get("concurrency_test"):
+                results: List[Any] = []
+                threads: List[threading.Thread] = []
+                actor_value = _scenario_actor(sc["name"])
+
+                def worker(payload: Dict[str, Any]) -> None:
+                    try:
+                        r = _http(method, url, payload, timeout=5)
+                        results.append(r.status_code)
+                    except Exception as e:
+                        results.append(f"ERROR:{e}")
+
+                worker_count = max_capacity + 3
+                for n in range(worker_count):
+                    payload = dict(sc.get("payload") or sample_request)
+                    payload = _apply_isolation_actor(payload, isolation_field if isolation_enabled else None, actor_value)
+                    payload["_capaxQaNonce"] = f"overflow_{n}"
+                    t = threading.Thread(target=worker, args=(payload,))
+                    threads.append(t)
+                    t.start()
+
+                for t in threads:
+                    t.join()
+
+                emit(f"  concurrency results: {results}")
+
+                missing = []
+                if sc["expect"] not in results:
+                    missing.append(sc["expect"])
+                if accepted_status not in results:
+                    missing.append(accepted_status)
+
+                if missing:
+                    ok = False
+                    errors.append(
+                        {
+                            "scenario": sc["name"],
+                            "error": "unexpected_concurrency_profile",
+                            "expected_to_see": [accepted_status, sc["expect"]],
+                            "results": results,
+                        }
+                    )
+                    emit(f"  FAIL - expected to see both {accepted_status} and {sc['expect']} in results")
                 else:
-                    r = requests.request(method, url, json=body, timeout=timeout_s)
-            except Exception as e:
-                print(" -> request failed")
-                errors.append(f"{sc.name} step {idx}: request failed: {e}")
-                continue
+                    emit("  PASS")
 
-            got = r.status_code
-            server_cost = ""
-            try:
-                js = r.json()
-                if isinstance(js, dict) and "cost" in js:
-                    server_cost = f" server_cost={js.get('cost')}"
-            except Exception:
-                pass
+            elif sc.get("mix_test"):
+                results: List[int] = []
+                values = sc.get("mix_values", [])
+                actor_value = _scenario_actor(sc["name"])
+                for idx, value in enumerate(values):
+                    payload = dict(sample_request)
+                    if field:
+                        payload[field] = value
+                    payload = _apply_isolation_actor(payload, isolation_field if isolation_enabled else None, actor_value)
+                    payload["_capaxQaNonce"] = f"mix_{idx}"
+                    r = _http(method, url, payload, timeout=5)
+                    results.append(r.status_code)
+                    emit(f"  mix value={value!r} -> status {r.status_code}")
 
-            print(f" got={got}{server_cost}")
+                allowed = set(sc["expect_any"])
+                unexpected = [status for status in results if status not in allowed]
+                has_accept = accepted_status in results
+                has_overflow = 429 in results
+                if unexpected or not has_accept or not has_overflow:
+                    ok = False
+                    errors.append(
+                        {
+                            "scenario": sc["name"],
+                            "error": "mixed_results_unexpected",
+                            "results": results,
+                            "allowed": list(allowed),
+                            "expected_profile": [accepted_status, 429],
+                        }
+                    )
+                    emit(
+                        f"  FAIL - expected mixed workload to show at least one {accepted_status} and one 429 without other statuses"
+                    )
+                else:
+                    emit("  PASS")
 
-            if got != exp:
-                errors.append(f"{sc.name} step {idx}: expected {exp}, got {got}, body={r.text[:300]}")
-                continue
+            elif sc.get("simulation_test"):
+                rounds = int(sc.get("simulation_rounds", 20))
+                seen: List[int] = []
+                rnd = random.Random(0)
+                for n in range(rounds):
+                    payload = dict(sample_request)
+                    if field:
+                        choice_pool: List[Any] = []
+                        for kv in known_values:
+                            choice_pool.append(kv)
+                            choice_pool.extend(_case_variants(str(kv)))
+                        choice_pool.append("totally_unexpected_value")
+                        value = rnd.choice(choice_pool) if choice_pool else "totally_unexpected_value"
+                        payload[field] = value
+                    actor_value = _scenario_actor(sc["name"], f"_{n}") if isolation_enabled and isolation_field else None
+                    payload = _apply_isolation_actor(payload, isolation_field if isolation_enabled else None, actor_value)
+                    payload["_capaxQaNonce"] = f"sim_{n}"
 
-            if method == "GET" and "expect_contains" in step:
-                try:
-                    js2 = r.json()
-                except Exception:
-                    errors.append(f"{sc.name} step {idx}: expected JSON, got {r.text[:200]}")
-                    continue
-                ec = step["expect_contains"]
-                if "servedOrders_len_at_least" in ec:
-                    if len(js2.get("servedOrders", [])) < int(ec["servedOrders_len_at_least"]):
-                        errors.append(f"{sc.name} step {idx}: servedOrders_len_at_least expected {ec['servedOrders_len_at_least']}, got {len(js2.get('servedOrders', []))}")
+                    r = _http(method, url, payload, timeout=5)
+                    seen.append(r.status_code)
+                    emit(f"  simulation {n+1}/{rounds}: status {r.status_code}")
 
-        print(f"  Drain: WAIT {drain_wait:.2f}s (scenario isolation)")
-        time.sleep(drain_wait)
+                allowed = set(sc["expect_any"])
+                if any(status not in allowed for status in seen):
+                    ok = False
+                    errors.append(
+                        {
+                            "scenario": sc["name"],
+                            "error": "simulation_unexpected_status",
+                            "results": seen,
+                            "allowed": list(allowed),
+                        }
+                    )
+                    emit(f"  FAIL - unexpected status in simulation results {seen}")
+                elif known_values and isolation_enabled and isolation_field and accepted_status not in seen:
+                    ok = False
+                    errors.append(
+                        {
+                            "scenario": sc["name"],
+                            "error": "simulation_missing_accept",
+                            "results": seen,
+                            "expected_to_see": accepted_status,
+                        }
+                    )
+                    emit(f"  FAIL - expected at least one valid request to be accepted with status {accepted_status}")
+                else:
+                    emit("  PASS")
 
-    return (len(errors) == 0), errors
+            else:
+                payload = dict(sc.get("payload") or {})
+                if not payload:
+                    payload = dict(sample_request)
+                actor_value = _scenario_actor(sc["name"]) if isolation_enabled and isolation_field else None
+                payload = _apply_isolation_actor(payload, isolation_field if isolation_enabled else None, actor_value)
+                payload["_capaxQaNonce"] = sc["name"]
+
+                emit(f"  payload: {json.dumps(payload, ensure_ascii=False)}")
+                r = _http(method, url, payload, timeout=5)
+                emit(f"  status: {r.status_code}")
+
+                if r.status_code != sc["expect"]:
+                    ok = False
+                    errors.append(
+                        {
+                            "scenario": sc["name"],
+                            "expected": sc["expect"],
+                            "got": r.status_code,
+                            "body": r.text,
+                        }
+                    )
+                    emit(f"  FAIL - expected {sc['expect']}, got {r.status_code}")
+                else:
+                    emit("  PASS")
+
+        except Exception as e:
+            ok = False
+            errors.append({"scenario": sc["name"], "error": str(e)})
+            emit(f"  ERROR: {e}")
+
+        emit("")
+
+    return ok, errors
+
+
+def save_report(path: Path, ok: bool, errors: List[Dict[str, Any]], scenarios: List[Dict[str, Any]], url: str) -> None:
+    report = {
+        "target": url,
+        "ok": ok,
+        "errors": errors,
+        "scenarios": scenarios,
+        "timestamp": time.time(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+

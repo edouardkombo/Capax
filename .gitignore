@@ -4,8 +4,9 @@ __pycache__/
 server.log
 nohup.out
 .gate/
+.capax/
+capax.egg-info/
 packs/
 packs/*/compiled_policy.json
 gen/
 server/
-capax.egg-info/
